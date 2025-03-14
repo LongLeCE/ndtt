@@ -14,7 +14,8 @@ import csv
 # If modifying these scopes, delete the file token.json.
 SCOPES = [
 	'https://www.googleapis.com/auth/presentations',
-	'https://www.googleapis.com/auth/spreadsheets'
+	'https://www.googleapis.com/auth/spreadsheets',
+	'https://www.googleapis.com/auth/youtube.force-ssl'
 ]
 
 
@@ -22,10 +23,12 @@ def build_parser():
 	parser = ArgumentParser()
 	parser.add_argument('--name', '-n', required=True, help='name of presentation')
 	parser.add_argument('--urls', '-u', required=True, help='path to csv file containing the urls')
+	parser.add_argument('--host', '-ho', help='name of host (will subtract 1 from total number of players for score formula if host found in player list)')
 	parser.add_argument('--duration', '-d', type=int, default=0, help='duration of playback in seconds, 0 means unlimited, default = 0')
 	parser.add_argument('--fillers', '-f', type=int, default=0, help='number of filler slides to prepend at the beginning (to avoid peeking), default = 0')
 	parser.add_argument('--rows', '-r', type=int, default=3, help='number of rows of videos per slide, default = 3')
 	parser.add_argument('--cols', '-c', type=int, default=3, help='number of cols of videos per slide, default = 3')
+	parser.add_argument('--limit', '-l', type=int, default=9, help='max number of videos per slide, if less than rows * cols desired, default = 9 (3x3)')
 	parser.add_argument('--width', '-wr', type=float, default=0.3, help='ratio between a single video width and slide width, default = 0.3')
 	parser.add_argument('--height', '-hr', type=float, default=0.3, help='ratio between a single video height and slide height, default = 0.3')
 	parser.add_argument('--shuffle', '-s', action='store_true', help='shuffles the given url list')
@@ -55,7 +58,8 @@ def build_gservices():
 
 	return {
 		'slides': build('slides', 'v1', credentials=creds),
-		'sheets': build('sheets', 'v4', credentials=creds)
+		'sheets': build('sheets', 'v4', credentials=creds),
+		'youtube': build('youtube', 'v3', credentials=creds)
 	}
 
 
@@ -83,6 +87,8 @@ def create_slides(service, presentation_id, layout='BLANK', n=1, idx=None):
 
 
 def filler_slides(service, presentation_id, n=1, idx=None):
+	if n == 0:
+		return
 	create_slides(service, presentation_id, layout='TITLE', n=n, idx=idx)
 	presentation = get_presentation(service, presentation_id)
 	start_idx = idx if idx is not None else len(presentation['slides']) - n
@@ -112,8 +118,10 @@ def extract_params_from_youtube_url(url):
 	return params
 
 
-def video_slides(service, presentation_id, urls, duration=0, rows=3, cols=3, w_r=0.3, h_r=0.3, idx=None):
+def video_slides(service, presentation_id, video_ids, duration=0, rows=3, cols=3, w_r=0.3, h_r=0.3, limit_per_page=None, idx=None):
 	num_vids_per_slide = rows * cols
+	if limit_per_page is not None:
+		num_vids_per_slide = min(num_vids_per_slide, limit_per_page)
 	num_slides = math.ceil(len(urls) / num_vids_per_slide)
 	slide_ids = create_slides(service, presentation_id, layout='BLANK', n=num_slides, idx=idx)
 	presentation = get_presentation(service, presentation_id)
@@ -146,8 +154,8 @@ def video_slides(service, presentation_id, urls, duration=0, rows=3, cols=3, w_r
 					'transform': {
 						'scaleX': 1,
 						'scaleY': 1,
-						'translateX': (i % num_vids_per_slide % 3) * video_w + video_block_x,
-						'translateY': ((i % num_vids_per_slide) // 3) * video_h + video_block_y,
+						'translateX': (i % num_vids_per_slide % cols) * video_w + video_block_x,
+						'translateY': ((i % num_vids_per_slide) // rows) * video_h + video_block_y,
 						'unit': unit
 					}
 				}
@@ -233,9 +241,10 @@ def num2col(n):
 	return col
 
 
-def populate_spreadsheet(service, spreadsheet_id, urls):
+def populate_spreadsheet(service, spreadsheet_id, urls, host=None):
 	players = sorted({url[0] for url in urls})
 	num_players = len(players)
+	is_host_in_player_list = host in players
 	last_player_col = num2col(num_players)
 	num_songs = len(urls)
 	data = [
@@ -275,7 +284,7 @@ def populate_spreadsheet(service, spreadsheet_id, urls):
 			'range': f'Round!{num2col(num_players + 2)}1:{num2col(num_players + 2)}2',
 			'values': [
 				['Number of players'],
-				[num_players]
+				[num_players - 1 if is_host_in_player_list else num_players]
 			]
 		},
 		{
@@ -284,6 +293,41 @@ def populate_spreadsheet(service, spreadsheet_id, urls):
 		}
 	]
 	service.spreadsheets().values().batchUpdate(spreadsheetId=spreadsheet_id, body={'valueInputOption': 'USER_ENTERED', 'data': data}).execute()
+
+
+def create_playlist(service, title, description=None, privacy_status='public'):
+	request_body = {
+		'snippet': {
+			'title': title
+		},
+		'status': {
+			'privacyStatus': privacy_status
+		}
+	}
+	if description:
+		request_body['snippet']['description'] = description
+	playlist = service.playlists().insert(
+		part='id,snippet,status',
+		body=request_body
+	).execute()
+	playlist_id = playlist['id']
+	return playlist_id
+
+
+def populate_playlist(service, playlist_id, video_ids):
+	for video_id in video_ids:
+		service.playlistItems().insert(
+            part='snippet',
+            body={
+                'snippet': {
+                    'playlistId': playlist_id,
+                    'resourceId': {
+                        'kind': 'youtube#video',
+                        'videoId': video_id
+                    }
+                }
+            }
+        ).execute()
 
 
 def main(args):
@@ -295,19 +339,30 @@ def main(args):
 				urls.append(row)
 		if args.shuffle:
 			shuffle(urls)
+		video_ids = map(lambda x: extract_params_from_youtube_url(x[1])['v'][0], urls)
 
 		services = build_gservices()
 		slide_service = services['slides']
 		sheets_service = services['sheets']
+		youtube_service = services['youtube']
 
+		print('Creating presentation...')
 		presentation_id = create_presentation(slide_service, name=args.name)
 		filler_slides(slide_service, presentation_id, n=args.fillers)
-		video_slides(slide_service, presentation_id, urls, duration=args.duration, rows=args.rows, cols=args.cols, w_r=args.width, h_r=args.height)
+		video_slides(slide_service, presentation_id, video_ids, duration=args.duration, rows=args.rows, cols=args.cols, w_r=args.width, h_r=args.height, limit_per_page=args.limit)
+		print(f'Presentation URL: https://docs.google.com/presentation/d/{presentation_id}\nDone')
 
+		print('Creating spreadsheet...')
 		spreadsheet_id = create_spreadsheet(sheets_service, name=args.name)
 		create_sheets(sheets_service, spreadsheet_id, ['Guess', 'Total', 'Round'])
 		delete_sheet(sheets_service, spreadsheet_id, 0)
-		populate_spreadsheet(sheets_service, spreadsheet_id, urls)
+		populate_spreadsheet(sheets_service, spreadsheet_id, urls, host=args.host)
+		print(f'Spreadsheet URL: https://docs.google.com/spreadsheets/d/{spreadsheet_id}\nDone')
+
+		print('Creating playlist...')
+		playlist_id = create_playlist(youtube_service, args.name)
+		populate_playlist(youtube_service, playlist_id, video_ids)
+		print(f'Playlist URL: https://www.youtube.com/playlist?list={playlist_id}\nDone')
 	except HttpError as err:
 		print(err)
 	else:
